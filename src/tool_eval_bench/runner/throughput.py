@@ -694,9 +694,31 @@ async def _stream_one(
         if error_response is None:
             elapsed = (time.perf_counter() - t0) * 1000
             return ThroughputSample(error=str(exc), total_ms=elapsed)
-        await error_response.aread()
+        # The exception propagated out of the ``async with`` block, so the
+        # streaming response context manager has already closed the response.
+        # Re-reading a closed stream raises httpx.StreamClosed ("Attempted to
+        # read or stream content, but the stream has been closed.") which
+        # masks the real HTTP error and skips the retries below.  Read the
+        # body defensively and keep a plain-text copy for the retry helpers,
+        # which touch ``.text`` afterwards.
+        body_text = ""
+        try:
+            await error_response.aread()
+            body_text = error_response.text
+        except Exception:
+            logger.debug(
+                "Could not re-read error response body (stream already closed); "
+                "continuing with status %s",
+                error_response.status_code,
+            )
+        else:
+            logger.warning(
+                "Streaming request rejected with HTTP %s: %s",
+                error_response.status_code,
+                body_text[:200],
+            )
         retry_payload = max_tokens_retry_payload(
-            payload, error_response.status_code, error_response.text
+            payload, error_response.status_code, body_text
         )
         if retry_payload is not None and tok_cfg is not None:
             tok_cfg.output_token_field = "max_completion_tokens"
