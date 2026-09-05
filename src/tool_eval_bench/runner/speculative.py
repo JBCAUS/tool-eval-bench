@@ -45,12 +45,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SpecDecodeCounters:
-    """Snapshot of speculative decoding counters from Prometheus /metrics."""
+    """Snapshot of speculative decoding metrics from Prometheus /metrics."""
 
     accepted_tokens: float = 0.0
     draft_tokens: float = 0.0
     num_drafts: float = 0.0
     timestamp: float = 0.0
+    sglang_accept_rate: float | None = None
+    sglang_accept_length: float | None = None
 
     @property
     def acceptance_rate(self) -> float | None:
@@ -90,12 +92,21 @@ _PROM_PATTERNS = {
     ),
 }
 
+_SGLANG_GAUGE_PATTERNS = {
+    "sglang_accept_rate": re.compile(
+        rf"^sglang:spec_accept_rate(?:\{{[^}}]*\}})?\s+{_NUM}", re.MULTILINE
+    ),
+    "sglang_accept_length": re.compile(
+        rf"^sglang:spec_accept_length(?:\{{[^}}]*\}})?\s+{_NUM}", re.MULTILINE
+    ),
+}
+
 
 def parse_prometheus_spec_metrics(text: str) -> SpecDecodeCounters:
-    """Parse speculative decoding counters from Prometheus text format.
+    """Parse speculative decoding counters and SGLang gauges.
 
-    Works with vLLM and compatible servers exposing counters with
-    the ``spec_decode_`` prefix.
+    Counter series are summed across workers. SGLang gauges are rolling
+    snapshots, so the last series in deterministic Prometheus file order wins.
     """
     counters = SpecDecodeCounters(timestamp=time.time())
 
@@ -103,6 +114,11 @@ def parse_prometheus_spec_metrics(text: str) -> SpecDecodeCounters:
         matches = list(pattern.finditer(text))
         if matches:
             setattr(counters, field_name, sum(float(match.group(1)) for match in matches))
+
+    for field_name, pattern in _SGLANG_GAUGE_PATTERNS.items():
+        matches = list(pattern.finditer(text))
+        if matches:
+            setattr(counters, field_name, float(matches[-1].group(1)))
 
     return counters
 
@@ -129,8 +145,9 @@ async def scrape_spec_metrics(
         if counters.draft_tokens > 0 or counters.accepted_tokens > 0:
             return counters
         # Also return if counters are all zero but the metric names are present
-        # (server has spec decode but hasn't processed any requests yet)
-        if "spec_decode" in resp.text:
+        # (server has spec decode but hasn't processed any requests yet), or
+        # when SGLang exposes rolling gauges instead of cumulative counters.
+        if "spec_decode" in resp.text or "sglang:spec_accept_" in resp.text:
             return counters
         return None
     except Exception as exc:
@@ -152,6 +169,7 @@ class SpecDecodeInfo:
     has_prometheus: bool = False
     has_per_request_timings: bool = False  # llama.cpp: draft_n in response timings
     detail: str = ""
+    has_sglang_gauges: bool = False
 
 
 async def detect_spec_decoding(
@@ -177,8 +195,17 @@ async def detect_spec_decoding(
         if resp.status_code == 200:
             text = resp.text
 
+            # SGLang exports rolling gauges rather than cumulative counters.
+            # Prefer this more specific signal if a compatible exporter also
+            # exposes generic spec_decode metric names.
+            if "sglang:spec_accept_rate" in text or "sglang:spec_accept_length" in text:
+                info.active = True
+                info.has_prometheus = True
+                info.has_sglang_gauges = True
+                info.detail = "Detected via Prometheus /metrics (SGLang spec gauges)"
+
             # vLLM and compatible exporters: look for spec_decode counters.
-            if "spec_decode" in text:
+            elif "spec_decode" in text:
                 info.active = True
                 info.has_prometheus = True
                 info.detail = "Detected via Prometheus /metrics (spec_decode counters present)"
@@ -277,6 +304,9 @@ class SpecDecodeSample:
     # Prompt type used
     prompt_type: str = "filler"  # filler / code / structured
 
+    # SGLang reports windowed acceptance gauges, not per-request draft counts.
+    has_windowed_acceptance: bool = False
+
     @property
     def effective_tg_tps(self) -> float:
         """Output tokens ÷ wall-clock time — the metric users actually feel."""
@@ -323,11 +353,9 @@ class SpecDecodeSample:
 
     @property
     def waste_ratio(self) -> float | None:
-        """Fraction of drafted tokens rejected by the verifier (0.0–1.0).
-
-        Lower is better. A value of 0.82 means 82% of draft compute is
-        discarded — the draft model is poorly aligned with the target.
-        """
+        """Fraction of per-request drafted tokens rejected by the verifier."""
+        if self.has_windowed_acceptance:
+            return None
         if self.acceptance_rate is not None:
             return 1.0 - self.acceptance_rate
         return None
@@ -489,12 +517,20 @@ async def measure_spec_single(
     )
     spec_sample.baseline_tg_tps = baseline_tg_tps
 
-    # Scrape counters AFTER generation and compute deltas
-    if spec_info.has_prometheus and counters_before is not None:
+    # Scrape metrics AFTER generation. SGLang gauges need no baseline, while
+    # cumulative counters still require a valid before/after pair.
+    if spec_info.has_prometheus:
         counters_after = await scrape_spec_metrics(
             client, base_url, api_key, metrics_url=metrics_url
         )
-        if counters_after is not None:
+        if counters_after is not None and spec_info.has_sglang_gauges:
+            # These are rolling gauges rather than cumulative counters.
+            # At spec-bench's standard concurrency of one, the final values
+            # are dominated by the request that just completed.
+            spec_sample.acceptance_rate = counters_after.sglang_accept_rate
+            spec_sample.acceptance_length = counters_after.sglang_accept_length
+            spec_sample.has_windowed_acceptance = True
+        elif counters_after is not None and counters_before is not None:
             spec_sample.draft_tokens_delta = int(
                 counters_after.draft_tokens - counters_before.draft_tokens
             )
@@ -505,7 +541,7 @@ async def measure_spec_single(
                 counters_after.num_drafts - counters_before.num_drafts
             )
 
-            # Compute rates from deltas
+            # Compute rates from cumulative counter deltas.
             dt = spec_sample.draft_tokens_delta
             at = spec_sample.accepted_tokens_delta
             nd = spec_sample.num_drafts_delta
@@ -517,7 +553,11 @@ async def measure_spec_single(
     # Fallback: llama.cpp per-request timings (draft_n / draft_n_accepted)
     # These are embedded in the SSE response by llama-server and extracted
     # by _stream_one() into ThroughputSample.draft_n / draft_n_accepted.
-    if spec_sample.draft_tokens_delta is None and sample.draft_n is not None:
+    if (
+        not spec_sample.has_windowed_acceptance
+        and spec_sample.draft_tokens_delta is None
+        and sample.draft_n is not None
+    ):
         spec_sample.draft_tokens_delta = sample.draft_n
         spec_sample.accepted_tokens_delta = sample.draft_n_accepted or 0
         if sample.draft_n > 0:
@@ -596,7 +636,14 @@ async def run_spec_bench(
             metrics_url=metrics_url,
         )
 
-        if spec_info.has_prometheus:
+        if spec_info.has_sglang_gauges:
+            logger.warning(
+                "SGLang /metrics acceptance values are rolling-window gauges. "
+                "They are dominated by the most recent request at concurrency 1, "
+                "but are approximate under concurrent traffic."
+            )
+            print()  # visual separator before results
+        elif spec_info.has_prometheus:
             logger.warning(
                 "Prometheus /metrics acceptance-rate counters are server-wide aggregates. "
                 "If other models are serving concurrent traffic on this endpoint, "
