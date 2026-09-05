@@ -75,12 +75,47 @@ def test_parses_last_sglang_gauge_series_without_summing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_measurement_maps_sglang_gauges_without_counter_deltas() -> None:
+@pytest.mark.parametrize(
+    ("before_status", "stream_draft_n"),
+    [(200, None), (503, None), (200, 10)],
+)
+async def test_measurement_maps_sglang_gauges_without_counter_deltas(
+    before_status: int,
+    stream_draft_n: int | None,
+) -> None:
+    metrics_calls = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal metrics_calls
         if request.url.path == "/metrics":
+            metrics_calls += 1
+            if metrics_calls == 1 and before_status != 200:
+                return httpx.Response(before_status)
             return httpx.Response(200, text=_SGLANG_METRICS)
         if request.url.path == "/v1/chat/completions":
-            return _sse_response()
+            response = _sse_response()
+            if stream_draft_n is not None:
+                chunks = [
+                    {
+                        "choices": [{"delta": {"content": "ok"}, "token_ids": [101]}],
+                        "timings": {
+                            "draft_n": stream_draft_n,
+                            "draft_n_accepted": stream_draft_n // 2,
+                        },
+                    },
+                    {
+                        "choices": [],
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 1},
+                    },
+                ]
+                body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+                body += "data: [DONE]\n\n"
+                response = httpx.Response(
+                    200,
+                    content=body.encode(),
+                    headers={"content-type": "text/event-stream"},
+                )
+            return response
         return httpx.Response(404)
 
     info = SpecDecodeInfo(
@@ -99,6 +134,7 @@ async def test_measurement_maps_sglang_gauges_without_counter_deltas() -> None:
             spec_info=info,
         )
 
+    assert metrics_calls == 2
     assert sample.error is None
     assert sample.acceptance_rate == pytest.approx(0.6)
     assert sample.acceptance_length == pytest.approx(2.8)
@@ -107,6 +143,49 @@ async def test_measurement_maps_sglang_gauges_without_counter_deltas() -> None:
     assert sample.num_drafts_delta is None
     assert sample.draft_tps is None
     assert sample.waste_ratio is None
+
+
+@pytest.mark.asyncio
+async def test_detection_prefers_sglang_gauges_over_generic_counters() -> None:
+    body = _SGLANG_METRICS + "spec_decode_num_draft_tokens_total 10\n"
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=body))
+
+    async with MeasurementTestClient(transport=transport) as client:
+        info = await detect_spec_decoding(client, "http://host:8888/v1")
+
+    assert info.active is True
+    assert info.has_prometheus is True
+    assert info.has_sglang_gauges is True
+    assert info.detail == "Detected via Prometheus /metrics (SGLang spec gauges)"
+
+
+def test_dataclass_positional_arguments_remain_compatible() -> None:
+    from tool_eval_bench.runner.speculative import SpecDecodeCounters
+
+    counters = SpecDecodeCounters(1, 2, 3, 4)
+    info = SpecDecodeInfo(True, "mtp", True, True, "detail")
+
+    assert counters.timestamp == 4
+    assert counters.sglang_accept_rate is None
+    assert counters.sglang_accept_length is None
+    assert info.has_per_request_timings is True
+    assert info.detail == "detail"
+    assert info.has_sglang_gauges is False
+
+
+@pytest.mark.asyncio
+async def test_zero_sglang_gauges_are_scrapeable() -> None:
+    from tool_eval_bench.runner.speculative import scrape_spec_metrics
+
+    body = "sglang:spec_accept_rate 0\nsglang:spec_accept_length 0\n"
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=body))
+
+    async with MeasurementTestClient(transport=transport) as client:
+        metrics = await scrape_spec_metrics(client, "http://host:8888/v1")
+
+    assert metrics is not None
+    assert metrics.sglang_accept_rate == 0
+    assert metrics.sglang_accept_length == 0
 
 
 @pytest.mark.asyncio
