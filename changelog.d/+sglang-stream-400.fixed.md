@@ -1,0 +1,1 @@
+Fixed a crash when a streaming completion was rejected with an HTTP 400 (e.g. SGLang rejecting return_token_ids with stream=true): the error handler re-read the already-closed response stream and aborted the run with "Attempted to read or stream content, but the stream has been closed." instead of surfacing the real error and retrying without the rejected field.
